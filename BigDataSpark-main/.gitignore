@@ -1,0 +1,17 @@
+postgres_data/
+clickhouse_data/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.vscode/
+.idea/
+*.swp
+*.swo
+*.log
+*.tmp
+.DS_Store

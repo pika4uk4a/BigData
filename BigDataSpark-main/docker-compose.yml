@@ -1,0 +1,152 @@
+services:
+  postgres:
+    image: postgres:latest
+    container_name: spark_postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: spark_db
+    ports:
+      - "6432:5432"
+    volumes:
+      - ./sql/init:/docker-entrypoint-initdb.d
+      - ./исходные данные:/data
+      - postgres_data:/var/lib/postgresql
+    networks:
+      - spark_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d spark_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  spark-master:
+    image: spark:python3
+    container_name: spark-master
+    command: ["/opt/spark/bin/spark-class","org.apache.spark.deploy.master.Master"]
+    environment:
+      SPARK_MASTER_HOST: spark-master
+      SPARK_MASTER_PORT: 7077
+      SPARK_MASTER_WEBUI_PORT: 8080
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+    volumes:
+      - ./spark:/opt/spark/work
+      - ./spark/jars:/opt/spark/jars/external
+    networks:
+      - spark_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  spark-worker:
+    image: spark:python3
+    container_name: spark-worker
+    command: ["/opt/spark/bin/spark-class","org.apache.spark.deploy.worker.Worker","spark://spark-master:7077"]
+    environment:
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 2g
+      SPARK_MASTER: spark://spark-master:7077
+    volumes:
+      - ./spark:/opt/spark/work
+      - ./spark/jars:/opt/spark/jars/external
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    networks:
+      - spark_network
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: spark-clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    environment:
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: "clickhouse"
+    networks:
+      - spark_network
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  clickhouse-init:
+    image: curlimages/curl:latest
+    container_name: spark-clickhouse-init
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    networks:
+      - spark_network
+    command: >
+      /bin/sh -c "
+      sleep 5 &&
+      curl -X POST 'http://default:clickhouse@clickhouse:8123/' --data 'CREATE DATABASE IF NOT EXISTS spark_marts;'
+      "
+    restart: "no"
+
+  etl-star:
+    image: spark:python3
+    container_name: spark-etl-star
+    command: >
+      /opt/spark/bin/spark-submit
+      --master spark://spark-master:7077
+      --jars /opt/spark/jars/external/postgresql-connector.jar
+      --conf spark.executor.extraClassPath=/opt/spark/jars/external/postgresql-connector.jar
+      --conf spark.driver.extraClassPath=/opt/spark/jars/external/postgresql-connector.jar
+      /opt/spark/work/etl_to_star_schema.py
+    volumes:
+      - ./spark:/opt/spark/work
+      - ./spark/jars:/opt/spark/jars/external
+    depends_on:
+      postgres:
+        condition: service_healthy
+      spark-master:
+        condition: service_healthy
+    networks:
+      - spark_network
+    restart: "no"
+
+  etl-clickhouse:
+    image: spark:python3
+    container_name: spark-etl-clickhouse
+    command: >
+      /opt/spark/bin/spark-submit
+      --master spark://spark-master:7077
+      --jars /opt/spark/jars/external/postgresql-connector.jar,/opt/spark/jars/external/clickhouse-jdbc.jar
+      --conf spark.executor.extraClassPath=/opt/spark/jars/external/postgresql-connector.jar:/opt/spark/jars/external/clickhouse-jdbc.jar
+      --conf spark.driver.extraClassPath=/opt/spark/jars/external/postgresql-connector.jar:/opt/spark/jars/external/clickhouse-jdbc.jar
+      /opt/spark/work/etl_to_clickhouse.py
+    volumes:
+      - ./spark:/opt/spark/work
+      - ./spark/jars:/opt/spark/jars/external
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      clickhouse-init:
+        condition: service_completed_successfully
+      etl-star:
+        condition: service_completed_successfully
+      spark-master:
+        condition: service_healthy
+    networks:
+      - spark_network
+    restart: "no"
+
+networks:
+  spark_network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+    driver: local
+  clickhouse_data:
+    driver: local
