@@ -1,0 +1,207 @@
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: flink-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - flink_network
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: flink-kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    networks:
+      - flink_network
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres:
+    image: postgres:latest
+    container_name: flink_postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: flink_db
+    ports:
+      - "6433:5432"
+    volumes:
+      - ./sql/init:/docker-entrypoint-initdb.d
+      - postgres_data:/var/lib/postgresql
+    networks:
+      - flink_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d flink_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres-init:
+    image: postgres:latest
+    container_name: flink_postgres_init
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPORT: 5432
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: flink_db
+    command: >
+      bash -c "
+      psql -c 'DROP TABLE IF EXISTS fact_sales CASCADE;' &&
+      psql -c 'DROP TABLE IF EXISTS dim_product CASCADE;' &&
+      psql -c 'DROP TABLE IF EXISTS dim_customer CASCADE;' &&
+      psql -c 'DROP TABLE IF EXISTS dim_seller CASCADE;' &&
+      psql -c 'DROP TABLE IF EXISTS dim_store CASCADE;' &&
+      psql -c 'CREATE TABLE dim_customer (customer_id INT PRIMARY KEY, customer_first_name VARCHAR(255), customer_last_name VARCHAR(255), customer_email VARCHAR(255), customer_country VARCHAR(255));' &&
+      psql -c 'CREATE TABLE dim_seller (seller_id INT PRIMARY KEY, seller_first_name VARCHAR(255), seller_last_name VARCHAR(255), seller_email VARCHAR(255), seller_country VARCHAR(255));' &&
+      psql -c 'CREATE TABLE dim_store (store_name VARCHAR(255), city VARCHAR(255), country VARCHAR(255), PRIMARY KEY (store_name, city));' &&
+      psql -c 'CREATE TABLE dim_product (product_id INT PRIMARY KEY, product_name VARCHAR(255), product_category VARCHAR(255), product_price DECIMAL(10, 2));' &&
+      psql -c 'CREATE TABLE fact_sales (sale_id SERIAL PRIMARY KEY, customer_id INTEGER NOT NULL, seller_id INTEGER NOT NULL, product_id INTEGER NOT NULL, store_name VARCHAR(255), city VARCHAR(255), quantity INTEGER, total_amount DECIMAL(10, 2), sale_date DATE);' &&
+      psql -c 'CREATE INDEX IF NOT EXISTS idx_fact_sales_date ON fact_sales(sale_date);' &&
+      psql -c 'CREATE INDEX IF NOT EXISTS idx_fact_sales_customer ON fact_sales(customer_id);' &&
+      psql -c 'CREATE INDEX IF NOT EXISTS idx_fact_sales_product ON fact_sales(product_id);'
+      "
+    networks:
+      - flink_network
+    restart: "no"
+
+  jobmanager:
+    build:
+      context: ./flink
+      dockerfile: Dockerfile
+    container_name: flink-jobmanager
+    command: jobmanager
+    ports:
+      - "8081:8081"
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        parallelism.default: 2
+        python.client.executable: python3
+        python.executable: python3
+      - PYTHONPATH=/usr/local/lib/python3.10/dist-packages:/usr/lib/python3.10/dist-packages
+    volumes:
+      - ./flink:/opt/flink/usrlib
+    networks:
+      - flink_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  taskmanager:
+    build:
+      context: ./flink
+      dockerfile: Dockerfile
+    container_name: flink-taskmanager
+    depends_on:
+      - jobmanager
+    command: taskmanager
+    scale: 1
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        parallelism.default: 2
+        python.client.executable: python3
+        python.executable: python3
+      - PYTHONPATH=/usr/local/lib/python3.10/dist-packages:/usr/lib/python3.10/dist-packages
+    volumes:
+      - ./flink:/opt/flink/usrlib
+    networks:
+      - flink_network
+
+  kafka-producer:
+    build:
+      context: ./kafka-producer
+      dockerfile: Dockerfile
+    container_name: flink-kafka-producer
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: mock_data_topic
+    volumes:
+      - ./исходные данные:/data
+    networks:
+      - flink_network
+    restart: "no"
+
+  flink-job:
+    build:
+      context: ./flink
+      dockerfile: Dockerfile
+    container_name: flink-streaming-job
+    depends_on:
+      jobmanager:
+        condition: service_healthy
+      taskmanager:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      postgres-init:
+        condition: service_completed_successfully
+      kafka-producer:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: mock_data_topic
+      POSTGRES_URL: jdbc:postgresql://postgres:5432/flink_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      PYTHONPATH: /usr/local/lib/python3.10/dist-packages:/usr/lib/python3.10/dist-packages
+      PYTHONUNBUFFERED: 1
+    volumes:
+      - ./flink:/opt/flink/usrlib
+    working_dir: /opt/flink
+    command: >
+      /bin/bash -c "
+      sleep 15 &&
+      /opt/flink/bin/flink run
+      --jobmanager jobmanager:8081
+      --python /opt/flink/usrlib/streaming_etl_simple.py
+      "
+    networks:
+      - flink_network
+    restart: "no"
+
+networks:
+  flink_network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+    driver: local
+
